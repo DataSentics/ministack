@@ -3,7 +3,7 @@ Glue Service Emulator.
 JSON-based API via X-Amz-Target (AWSGlue).
 Supports full Data Catalog: Databases, Tables, Partitions, Connections, Crawlers, Jobs, JobRuns.
 Also: SecurityConfigurations, Classifiers, PartitionIndexes, CrawlerMetrics, Tags,
-      Triggers, Workflows.
+      Triggers, Workflows, Schema Registry (registries, schemas, schema versions).
 Job execution: when Docker is available and the job command is ``glueetl`` or
 ``gluestreaming``, runs the script inside an ``amazon/aws-glue-libs`` container
 with Spark + awsglue.  Falls back to plain ``python3`` subprocess for non-Spark
@@ -109,6 +109,15 @@ _classifiers = AccountScopedDict()
 _triggers = AccountScopedDict()     # trigger_name -> trigger dict
 _workflows = AccountScopedDict()    # workflow_name -> workflow dict
 _workflow_runs = AccountScopedDict() # workflow_name -> [run, ...]
+_registries = AccountScopedDict()   # registry_name -> registry dict
+_schemas = AccountScopedDict()      # "registry/schema" -> schema set dict
+
+DEFAULT_SCHEMA_REGISTRY = "default-registry"
+_VALID_COMPATIBILITY = {
+    "NONE", "DISABLED", "BACKWARD", "BACKWARD_ALL", "FORWARD",
+    "FORWARD_ALL", "FULL", "FULL_ALL",
+}
+_VALID_DATA_FORMATS = {"AVRO", "JSON", "PROTOBUF"}
 
 _ALL_STATE = {
     "databases": _databases,
@@ -125,6 +134,8 @@ _ALL_STATE = {
     "triggers": _triggers,
     "workflows": _workflows,
     "workflow_runs": _workflow_runs,
+    "registries": _registries,
+    "schemas": _schemas,
 }
 
 
@@ -151,6 +162,127 @@ except Exception:
 
 def _arn(resource_type, name):
     return f"arn:aws:glue:{get_region()}:{get_account_id()}:{resource_type}/{name}"
+
+
+def _registry_arn(registry_name):
+    return _arn("registry", registry_name)
+
+
+def _schema_arn(registry_name, schema_name):
+    return f"arn:aws:glue:{get_region()}:{get_account_id()}:schema/{registry_name}/{schema_name}"
+
+
+def _iso_timestamp(ts=None):
+    if ts is None:
+        ts = time.time()
+    return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(ts))
+
+
+def _parse_registry_arn(arn):
+    prefix = f"arn:aws:glue:{get_region()}:{get_account_id()}:registry/"
+    if not arn or not arn.startswith(prefix):
+        return None
+    return arn[len(prefix):]
+
+
+def _parse_schema_arn(arn):
+    prefix = f"arn:aws:glue:{get_region()}:{get_account_id()}:schema/"
+    if not arn or not arn.startswith(prefix):
+        return None, None
+    tail = arn[len(prefix):]
+    if "/" not in tail:
+        return None, None
+    registry_name, schema_name = tail.split("/", 1)
+    return registry_name, schema_name
+
+
+def _ensure_default_registry():
+    if DEFAULT_SCHEMA_REGISTRY not in _registries:
+        now = _iso_timestamp()
+        _registries[DEFAULT_SCHEMA_REGISTRY] = {
+            "RegistryName": DEFAULT_SCHEMA_REGISTRY,
+            "RegistryArn": _registry_arn(DEFAULT_SCHEMA_REGISTRY),
+            "Description": "",
+            "Status": "AVAILABLE",
+            "CreatedTime": now,
+            "UpdatedTime": now,
+        }
+
+
+def _resolve_registry_name(registry_id=None):
+    registry_id = registry_id or {}
+    if registry_id.get("RegistryArn"):
+        name = _parse_registry_arn(registry_id["RegistryArn"])
+        if not name:
+            return None
+        return name
+    if registry_id.get("RegistryName"):
+        return registry_id["RegistryName"]
+    return DEFAULT_SCHEMA_REGISTRY
+
+
+def _resolve_schema_key(schema_id=None):
+    schema_id = schema_id or {}
+    if schema_id.get("SchemaArn"):
+        registry_name, schema_name = _parse_schema_arn(schema_id["SchemaArn"])
+        if not registry_name or not schema_name:
+            return None, None
+        return registry_name, schema_name
+    registry_name = _resolve_registry_name(schema_id)
+    schema_name = schema_id.get("SchemaName")
+    if not schema_name:
+        return None, None
+    return registry_name, schema_name
+
+
+def _schema_key(registry_name, schema_name):
+    return f"{registry_name}/{schema_name}"
+
+
+def _get_schema_record(registry_name, schema_name):
+    return _schemas.get(_schema_key(registry_name, schema_name))
+
+
+def _active_schema_versions(schema_rec):
+    return [
+        v for v in schema_rec.get("versions", [])
+        if v.get("Status") != "DELETING"
+    ]
+
+
+def _latest_schema_version(schema_rec):
+    versions = _active_schema_versions(schema_rec)
+    if not versions:
+        return None
+    return max(versions, key=lambda v: v["VersionNumber"])
+
+
+def _find_version_by_id(schema_rec, schema_version_id):
+    for v in schema_rec.get("versions", []):
+        if v.get("SchemaVersionId") == schema_version_id and v.get("Status") != "DELETING":
+            return v
+    return None
+
+
+def _find_version_by_definition(schema_rec, schema_definition):
+    for v in _active_schema_versions(schema_rec):
+        if v.get("SchemaDefinition") == schema_definition:
+            return v
+    return None
+
+
+def _schema_summary(schema_rec):
+    latest = _latest_schema_version(schema_rec)
+    latest_num = latest["VersionNumber"] if latest else 0
+    return {
+        "RegistryName": schema_rec["RegistryName"],
+        "SchemaName": schema_rec["SchemaName"],
+        "SchemaArn": schema_rec["SchemaArn"],
+        "SchemaStatus": schema_rec.get("SchemaStatus", "AVAILABLE"),
+        "CreatedTime": schema_rec.get("CreatedTime"),
+        "UpdatedTime": schema_rec.get("UpdatedTime"),
+        "LatestSchemaVersion": latest_num,
+    }
 
 
 async def handle_request(method, path, headers, body, query_params):
@@ -240,6 +372,23 @@ async def handle_request(method, path, headers, body, query_params):
         "TagResource": _tag_resource,
         "UntagResource": _untag_resource,
         "GetTags": _get_tags,
+        # Schema Registry
+        "CreateRegistry": _create_registry,
+        "GetRegistry": _get_registry,
+        "ListRegistries": _list_registries,
+        "UpdateRegistry": _update_registry,
+        "DeleteRegistry": _delete_registry,
+        "CreateSchema": _create_schema,
+        "GetSchema": _get_schema,
+        "ListSchemas": _list_schemas,
+        "UpdateSchema": _update_schema,
+        "DeleteSchema": _delete_schema,
+        "RegisterSchemaVersion": _register_schema_version,
+        "GetSchemaVersion": _get_schema_version,
+        "ListSchemaVersions": _list_schema_versions,
+        "DeleteSchemaVersions": _delete_schema_versions,
+        "GetSchemaByDefinition": _get_schema_by_definition,
+        "CheckSchemaVersionValidity": _check_schema_version_validity,
     }
 
     handler = handlers.get(action)
@@ -1365,6 +1514,547 @@ def _start_workflow_run(data):
     return json_response({"RunId": run_id})
 
 
+# ---- Schema Registry ----
+
+def _create_registry(data):
+    name = data.get("RegistryName")
+    if not name:
+        return error_response_json("InvalidInputException", "RegistryName is required", 400)
+    if name in _registries:
+        return error_response_json(
+            "AlreadyExistsException", f"Registry {name} already exists.", 400)
+    now = _iso_timestamp()
+    reg = {
+        "RegistryName": name,
+        "RegistryArn": _registry_arn(name),
+        "Description": data.get("Description", ""),
+        "Status": "AVAILABLE",
+        "CreatedTime": now,
+        "UpdatedTime": now,
+    }
+    _registries[name] = reg
+    if data.get("Tags"):
+        _tags[_registry_arn(name)] = dict(data["Tags"])
+    return json_response({
+        "RegistryName": name,
+        "RegistryArn": reg["RegistryArn"],
+        "Description": reg["Description"],
+        "Tags": data.get("Tags") or {},
+    })
+
+
+def _registry_name_from_request(data):
+    registry_id = data.get("RegistryId") or {}
+    if not registry_id.get("RegistryName") and not registry_id.get("RegistryArn"):
+        return None
+    return _resolve_registry_name(registry_id)
+
+
+def _get_registry(data):
+    name = _registry_name_from_request(data)
+    if not name:
+        return error_response_json("InvalidInputException", "RegistryId is required", 400)
+    reg = _registries.get(name)
+    if not reg or reg.get("Status") == "DELETING":
+        return error_response_json(
+            "EntityNotFoundException", f"Registry {name} not found.", 400)
+    return json_response({
+        "RegistryName": reg["RegistryName"],
+        "RegistryArn": reg["RegistryArn"],
+        "Description": reg.get("Description", ""),
+        "Status": reg.get("Status", "AVAILABLE"),
+        "CreatedTime": reg.get("CreatedTime"),
+        "UpdatedTime": reg.get("UpdatedTime"),
+    })
+
+
+def _list_registries(data):
+    max_results = data.get("MaxResults") or 25
+    start = 0
+    token = data.get("NextToken")
+    if token:
+        try:
+            start = int(token)
+        except ValueError:
+            start = 0
+    items = [
+        {
+            "RegistryName": r["RegistryName"],
+            "RegistryArn": r["RegistryArn"],
+            "Description": r.get("Description", ""),
+            "Status": r.get("Status", "AVAILABLE"),
+            "CreatedTime": r.get("CreatedTime"),
+            "UpdatedTime": r.get("UpdatedTime"),
+        }
+        for r in _registries.values()
+        if r.get("Status") != "DELETING"
+    ]
+    page = items[start:start + max_results]
+    resp = {"Registries": page}
+    nxt = start + max_results
+    if nxt < len(items):
+        resp["NextToken"] = str(nxt)
+    return json_response(resp)
+
+
+def _update_registry(data):
+    name = _registry_name_from_request(data)
+    if not name:
+        return error_response_json("InvalidInputException", "RegistryId is required", 400)
+    reg = _registries.get(name)
+    if not reg or reg.get("Status") == "DELETING":
+        return error_response_json(
+            "EntityNotFoundException", f"Registry {name} not found.", 400)
+    if "Description" in data:
+        reg["Description"] = data["Description"]
+    reg["UpdatedTime"] = _iso_timestamp()
+    return json_response({
+        "RegistryName": reg["RegistryName"],
+        "RegistryArn": reg["RegistryArn"],
+        "Description": reg.get("Description", ""),
+    })
+
+
+def _delete_registry(data):
+    name = _registry_name_from_request(data)
+    if not name:
+        return error_response_json("InvalidInputException", "RegistryId is required", 400)
+    if name not in _registries:
+        return error_response_json(
+            "EntityNotFoundException", f"Registry {name} not found.", 400)
+    del _registries[name]
+    _tags.pop(_registry_arn(name), None)
+    keys = [k for k in _schemas if k.startswith(f"{name}/")]
+    for k in keys:
+        del _schemas[k]
+    return json_response({
+        "RegistryName": name,
+        "RegistryArn": _registry_arn(name),
+    })
+
+
+def _create_schema(data):
+    schema_name = data.get("SchemaName")
+    if not schema_name:
+        return error_response_json("InvalidInputException", "SchemaName is required", 400)
+    data_format = data.get("DataFormat")
+    if not data_format:
+        return error_response_json("InvalidInputException", "DataFormat is required", 400)
+    if data_format not in _VALID_DATA_FORMATS:
+        return error_response_json(
+            "InvalidInputException", f"Invalid DataFormat: {data_format}", 400)
+    compatibility = data.get("Compatibility", "NONE")
+    if compatibility not in _VALID_COMPATIBILITY:
+        return error_response_json(
+            "InvalidInputException", f"Invalid Compatibility: {compatibility}", 400)
+
+    registry_name = _resolve_registry_name(data.get("RegistryId"))
+    if registry_name not in _registries:
+        if registry_name == DEFAULT_SCHEMA_REGISTRY:
+            _ensure_default_registry()
+        else:
+            return error_response_json(
+                "EntityNotFoundException",
+                f"Registry {registry_name} not found.",
+                400,
+            )
+
+    key = _schema_key(registry_name, schema_name)
+    if key in _schemas:
+        return error_response_json(
+            "AlreadyExistsException",
+            f"Schema {schema_name} already exists in registry {registry_name}.",
+            400,
+        )
+
+    now = _iso_timestamp()
+    schema_rec = {
+        "RegistryName": registry_name,
+        "RegistryArn": _registry_arn(registry_name),
+        "SchemaName": schema_name,
+        "SchemaArn": _schema_arn(registry_name, schema_name),
+        "DataFormat": data_format,
+        "Compatibility": compatibility,
+        "Description": data.get("Description", ""),
+        "SchemaStatus": "AVAILABLE",
+        "SchemaCheckpoint": 1,
+        "LatestSchemaVersion": 0,
+        "NextSchemaVersion": 1,
+        "CreatedTime": now,
+        "UpdatedTime": now,
+        "versions": [],
+    }
+    resp = {
+        "RegistryName": registry_name,
+        "RegistryArn": schema_rec["RegistryArn"],
+        "SchemaName": schema_name,
+        "SchemaArn": schema_rec["SchemaArn"],
+        "DataFormat": data_format,
+        "Compatibility": compatibility,
+        "Description": schema_rec["Description"],
+        "SchemaStatus": "AVAILABLE",
+        "SchemaCheckpoint": 1,
+        "Tags": data.get("Tags") or {},
+    }
+    definition = data.get("SchemaDefinition")
+    if definition:
+        version_id = new_uuid()
+        version = {
+            "SchemaVersionId": version_id,
+            "VersionNumber": 1,
+            "SchemaDefinition": definition,
+            "Status": "AVAILABLE",
+            "CreatedTime": now,
+        }
+        schema_rec["versions"].append(version)
+        schema_rec["LatestSchemaVersion"] = 1
+        schema_rec["NextSchemaVersion"] = 2
+        resp.update({
+            "LatestSchemaVersion": 1,
+            "NextSchemaVersion": 2,
+            "SchemaVersionId": version_id,
+            "SchemaVersionStatus": "AVAILABLE",
+        })
+    _schemas[key] = schema_rec
+    if data.get("Tags"):
+        _tags[schema_rec["SchemaArn"]] = dict(data["Tags"])
+    return json_response(resp)
+
+
+def _get_schema(data):
+    registry_name, schema_name = _resolve_schema_key(data.get("SchemaId"))
+    if not registry_name or not schema_name:
+        return error_response_json("InvalidInputException", "SchemaId is required", 400)
+    schema_rec = _get_schema_record(registry_name, schema_name)
+    if not schema_rec or schema_rec.get("SchemaStatus") == "DELETING":
+        return error_response_json(
+            "EntityNotFoundException",
+            f"Schema {schema_name} not found in registry {registry_name}.",
+            400,
+        )
+    latest = _latest_schema_version(schema_rec)
+    latest_num = latest["VersionNumber"] if latest else 0
+    return json_response({
+        "RegistryName": schema_rec["RegistryName"],
+        "RegistryArn": schema_rec["RegistryArn"],
+        "SchemaName": schema_rec["SchemaName"],
+        "SchemaArn": schema_rec["SchemaArn"],
+        "DataFormat": schema_rec["DataFormat"],
+        "Compatibility": schema_rec["Compatibility"],
+        "Description": schema_rec.get("Description", ""),
+        "SchemaStatus": schema_rec.get("SchemaStatus", "AVAILABLE"),
+        "SchemaCheckpoint": schema_rec.get("SchemaCheckpoint", 1),
+        "LatestSchemaVersion": latest_num,
+        "NextSchemaVersion": schema_rec.get("NextSchemaVersion", latest_num + 1),
+        "CreatedTime": schema_rec.get("CreatedTime"),
+        "UpdatedTime": schema_rec.get("UpdatedTime"),
+    })
+
+
+def _list_schemas(data):
+    registry_name = _resolve_registry_name(data.get("RegistryId"))
+    if registry_name not in _registries:
+        return error_response_json(
+            "EntityNotFoundException",
+            f"Registry {registry_name} not found.",
+            400,
+        )
+    max_results = data.get("MaxResults") or 25
+    start = 0
+    token = data.get("NextToken")
+    if token:
+        try:
+            start = int(token)
+        except ValueError:
+            start = 0
+    prefix = f"{registry_name}/"
+    items = [
+        _schema_summary(v)
+        for k, v in _schemas.items()
+        if k.startswith(prefix) and v.get("SchemaStatus") != "DELETING"
+    ]
+    page = items[start:start + max_results]
+    resp = {"Schemas": page}
+    nxt = start + max_results
+    if nxt < len(items):
+        resp["NextToken"] = str(nxt)
+    return json_response(resp)
+
+
+def _update_schema(data):
+    registry_name, schema_name = _resolve_schema_key(data.get("SchemaId"))
+    if not registry_name or not schema_name:
+        return error_response_json("InvalidInputException", "SchemaId is required", 400)
+    schema_rec = _get_schema_record(registry_name, schema_name)
+    if not schema_rec or schema_rec.get("SchemaStatus") == "DELETING":
+        return error_response_json(
+            "EntityNotFoundException",
+            f"Schema {schema_name} not found in registry {registry_name}.",
+            400,
+        )
+    if "Description" in data:
+        schema_rec["Description"] = data["Description"]
+    if "Compatibility" in data:
+        compat = data["Compatibility"]
+        if compat not in _VALID_COMPATIBILITY:
+            return error_response_json(
+                "InvalidInputException", f"Invalid Compatibility: {compat}", 400)
+        schema_rec["Compatibility"] = compat
+        schema_rec["SchemaCheckpoint"] = schema_rec.get("SchemaCheckpoint", 1) + 1
+    schema_rec["UpdatedTime"] = _iso_timestamp()
+    return json_response({
+        "SchemaName": schema_name,
+        "SchemaArn": schema_rec["SchemaArn"],
+        "Compatibility": schema_rec["Compatibility"],
+        "Description": schema_rec.get("Description", ""),
+    })
+
+
+def _delete_schema(data):
+    registry_name, schema_name = _resolve_schema_key(data.get("SchemaId"))
+    if not registry_name or not schema_name:
+        return error_response_json("InvalidInputException", "SchemaId is required", 400)
+    key = _schema_key(registry_name, schema_name)
+    if key not in _schemas:
+        return error_response_json(
+            "EntityNotFoundException",
+            f"Schema {schema_name} not found in registry {registry_name}.",
+            400,
+        )
+    schema_arn = _schemas[key]["SchemaArn"]
+    del _schemas[key]
+    _tags.pop(schema_arn, None)
+    return json_response({
+        "SchemaName": schema_name,
+        "SchemaArn": schema_arn,
+    })
+
+
+def _register_schema_version(data):
+    definition = data.get("SchemaDefinition")
+    if not definition:
+        return error_response_json(
+            "InvalidInputException", "SchemaDefinition is required", 400)
+    registry_name, schema_name = _resolve_schema_key(data.get("SchemaId"))
+    if not registry_name or not schema_name:
+        return error_response_json("InvalidInputException", "SchemaId is required", 400)
+    schema_rec = _get_schema_record(registry_name, schema_name)
+    if not schema_rec or schema_rec.get("SchemaStatus") == "DELETING":
+        return error_response_json(
+            "EntityNotFoundException",
+            f"Schema {schema_name} not found in registry {registry_name}.",
+            400,
+        )
+
+    existing = _find_version_by_definition(schema_rec, definition)
+    if existing:
+        return json_response({
+            "SchemaVersionId": existing["SchemaVersionId"],
+            "VersionNumber": existing["VersionNumber"],
+            "Status": existing.get("Status", "AVAILABLE"),
+        })
+
+    compatibility = schema_rec.get("Compatibility", "NONE")
+    active = _active_schema_versions(schema_rec)
+    if compatibility == "DISABLED" and active:
+        return error_response_json(
+            "InvalidInputException",
+            "Schema version registration is disabled for this schema.",
+            400,
+        )
+
+    version_number = schema_rec.get("NextSchemaVersion", len(active) + 1)
+    version_id = new_uuid()
+    now = _iso_timestamp()
+    version = {
+        "SchemaVersionId": version_id,
+        "VersionNumber": version_number,
+        "SchemaDefinition": definition,
+        "Status": "AVAILABLE",
+        "CreatedTime": now,
+    }
+    schema_rec.setdefault("versions", []).append(version)
+    schema_rec["LatestSchemaVersion"] = version_number
+    schema_rec["NextSchemaVersion"] = version_number + 1
+    schema_rec["UpdatedTime"] = now
+    return json_response({
+        "SchemaVersionId": version_id,
+        "VersionNumber": version_number,
+        "Status": "AVAILABLE",
+    })
+
+
+def _get_schema_version(data):
+    schema_version_id = data.get("SchemaVersionId")
+    schema_rec = None
+    version = None
+
+    if schema_version_id:
+        for rec in _schemas.values():
+            version = _find_version_by_id(rec, schema_version_id)
+            if version:
+                schema_rec = rec
+                break
+        if not version:
+            return error_response_json(
+                "EntityNotFoundException",
+                f"Schema version {schema_version_id} not found.",
+                400,
+            )
+    else:
+        registry_name, schema_name = _resolve_schema_key(data.get("SchemaId"))
+        if not registry_name or not schema_name:
+            return error_response_json(
+                "InvalidInputException",
+                "SchemaId or SchemaVersionId is required",
+                400,
+            )
+        schema_rec = _get_schema_record(registry_name, schema_name)
+        if not schema_rec or schema_rec.get("SchemaStatus") == "DELETING":
+            return error_response_json(
+                "EntityNotFoundException",
+                f"Schema {schema_name} not found in registry {registry_name}.",
+                400,
+            )
+        version_number = data.get("SchemaVersionNumber") or {}
+        if version_number.get("LatestVersion"):
+            version = _latest_schema_version(schema_rec)
+        elif version_number.get("VersionNumber") is not None:
+            vn = version_number["VersionNumber"]
+            version = next(
+                (v for v in _active_schema_versions(schema_rec)
+                 if v["VersionNumber"] == vn),
+                None,
+            )
+        else:
+            version = _latest_schema_version(schema_rec)
+        if not version:
+            return error_response_json(
+                "EntityNotFoundException", "Schema version not found.", 400)
+
+    return json_response({
+        "SchemaArn": schema_rec["SchemaArn"],
+        "SchemaDefinition": version["SchemaDefinition"],
+        "DataFormat": schema_rec["DataFormat"],
+        "SchemaVersionId": version["SchemaVersionId"],
+        "VersionNumber": version["VersionNumber"],
+        "Status": version.get("Status", "AVAILABLE"),
+        "CreatedTime": version.get("CreatedTime"),
+    })
+
+
+def _list_schema_versions(data):
+    registry_name, schema_name = _resolve_schema_key(data.get("SchemaId"))
+    if not registry_name or not schema_name:
+        return error_response_json("InvalidInputException", "SchemaId is required", 400)
+    schema_rec = _get_schema_record(registry_name, schema_name)
+    if not schema_rec or schema_rec.get("SchemaStatus") == "DELETING":
+        return error_response_json(
+            "EntityNotFoundException",
+            f"Schema {schema_name} not found in registry {registry_name}.",
+            400,
+        )
+    max_results = data.get("MaxResults") or 25
+    start = 0
+    token = data.get("NextToken")
+    if token:
+        try:
+            start = int(token)
+        except ValueError:
+            start = 0
+    items = [
+        {
+            "SchemaVersionId": v["SchemaVersionId"],
+            "VersionNumber": v["VersionNumber"],
+            "Status": v.get("Status", "AVAILABLE"),
+            "CreatedTime": v.get("CreatedTime"),
+        }
+        for v in sorted(_active_schema_versions(schema_rec),
+                        key=lambda x: x["VersionNumber"])
+    ]
+    page = items[start:start + max_results]
+    resp = {"Schemas": page}
+    nxt = start + max_results
+    if nxt < len(items):
+        resp["NextToken"] = str(nxt)
+    return json_response(resp)
+
+
+def _delete_schema_versions(data):
+    registry_name, schema_name = _resolve_schema_key(data.get("SchemaId"))
+    if not registry_name or not schema_name:
+        return error_response_json("InvalidInputException", "SchemaId is required", 400)
+    schema_rec = _get_schema_record(registry_name, schema_name)
+    if not schema_rec:
+        return error_response_json(
+            "EntityNotFoundException",
+            f"Schema {schema_name} not found in registry {registry_name}.",
+            400,
+        )
+    ids = set(data.get("SchemaVersionIds") or [])
+    deleted = []
+    for v in schema_rec.get("versions", []):
+        if v.get("SchemaVersionId") in ids:
+            v["Status"] = "DELETING"
+            deleted.append(v["SchemaVersionId"])
+    return json_response({
+        "SchemaVersionIds": deleted,
+        "Errors": [],
+    })
+
+
+def _get_schema_by_definition(data):
+    registry_name = _resolve_registry_name(data.get("SchemaId"))
+    definition = data.get("SchemaDefinition")
+    if not definition:
+        return error_response_json(
+            "InvalidInputException", "SchemaDefinition is required", 400)
+    for schema_rec in _schemas.values():
+        if schema_rec.get("RegistryName") != registry_name:
+            continue
+        if schema_rec.get("SchemaStatus") == "DELETING":
+            continue
+        version = _find_version_by_definition(schema_rec, definition)
+        if version:
+            return json_response({
+                "SchemaArn": schema_rec["SchemaArn"],
+                "SchemaName": schema_rec["SchemaName"],
+                "RegistryName": schema_rec["RegistryName"],
+                "SchemaVersionId": version["SchemaVersionId"],
+                "VersionNumber": version["VersionNumber"],
+                "Status": version.get("Status", "AVAILABLE"),
+            })
+    return error_response_json(
+        "EntityNotFoundException", "Schema version not found.", 400)
+
+
+def _check_schema_version_validity(data):
+    definition = data.get("SchemaDefinition")
+    if not definition:
+        return error_response_json(
+            "InvalidInputException", "SchemaDefinition is required", 400)
+    data_format = data.get("DataFormat")
+    if not data_format:
+        return error_response_json("InvalidInputException", "DataFormat is required", 400)
+    if data_format not in _VALID_DATA_FORMATS:
+        return error_response_json(
+            "InvalidInputException", f"Invalid DataFormat: {data_format}", 400)
+    # Lightweight syntax check (no deep Avro/Protobuf validation in emulator).
+    valid = bool(definition.strip())
+    if data_format in ("AVRO", "JSON") and valid:
+        try:
+            json.loads(definition)
+            valid = True
+        except json.JSONDecodeError:
+            valid = False
+    if not valid:
+        return json_response({
+            "Valid": False,
+            "Error": "Schema definition is not valid for the requested data format.",
+        })
+    return json_response({"Valid": True})
+
+
 # ---- Tags ----
 
 def _tag_resource(data):
@@ -1407,3 +2097,5 @@ def reset():
     _triggers.clear()
     _workflows.clear()
     _workflow_runs.clear()
+    _registries.clear()
+    _schemas.clear()
